@@ -19,9 +19,14 @@ describe('deterministic cheapest supplier', () => {
     const r = rankOffers([offer('Supplier A',500)]);
     expect(r.supplierOffers.find(o => o.supplier === 'Supplier D').status).toBe('MISSING');
   });
+  test('suppliers discovered in offer data are included without a hard-coded list', () => {
+    const r = rankOffers([offer('Supplier F',450), offer('Supplier A',500)]);
+    expect(r.supplierOffers.find(o => o.supplier === 'Supplier F').netRateAED).toBe(450);
+  });
   test('NOT_MAPPED supplier is not eligible', () => {
-    const r = rankOffers([offer('Supplier E',null,'NOT_MAPPED','No'),offer('Supplier A',500)]);
+    const r = rankOffers([offer('Supplier E',0,'NOT_MAPPED','No'),offer('Supplier A',500)]);
     expect(r.reasonCodes).toContain('SUPPLIER_NOT_MAPPED'); expect(r.cheapestSupplier).toBe('Supplier A');
+    expect(r.supplierOffers.find(o => o.supplier === 'Supplier E').netRateAED).toBeNull();
   });
   test('NO_RATE supplier is not eligible', () => {
     const r = rankOffers([offer('Supplier C',null,'NO_RATE','No'),offer('Supplier A',500)]);

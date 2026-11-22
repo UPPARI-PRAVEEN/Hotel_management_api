@@ -10,6 +10,8 @@
     "build": "vite build --config frontend/vite.config.mjs",
     "import:csv": "node src/ingestion/importCsv.js",
     "audit:csv": "node src/ingestion/importCsv.js --audit-only",
+    "demo:rate": "node scripts/demo-rate-audit.js",
+    "benchmark:api": "node scripts/benchmark-api.js",
     "test": "jest --runInBand",
     "test:watch": "jest --watch"
   },

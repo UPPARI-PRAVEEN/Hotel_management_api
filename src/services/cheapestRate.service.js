@@ -1,6 +1,15 @@
 const clickhouse = require('../config/clickhouse');
 
-const SUPPLIERS = ['Supplier A', 'Supplier B', 'Supplier C', 'Supplier D', 'Supplier E'];
+const DEFAULT_SUPPLIERS = ['Supplier A', 'Supplier B', 'Supplier C', 'Supplier D', 'Supplier E'];
+const CONFIGURED_SUPPLIERS = (process.env.SUPPLIER_NAMES || DEFAULT_SUPPLIERS.join(','))
+  .split(',')
+  .map(name => name.trim())
+  .filter(Boolean);
+
+function getSupplierNames(offers) {
+  return [...new Set([...CONFIGURED_SUPPLIERS, ...offers.map(offer => offer.Supplier).filter(Boolean)])]
+    .sort((a, b) => a.localeCompare(b));
+}
 
 function rankOffers(allOffers) {
   const eligible = allOffers.filter(o =>
@@ -16,19 +25,20 @@ function rankOffers(allOffers) {
     ? Number((saving / Number(runner.Net_Rate_AED) * 100).toFixed(2)) : null;
 
   const bySupplier = new Map(allOffers.map(o => [o.Supplier, o]));
-  const supplierOffers = SUPPLIERS.map(name => {
+  const supplierOffers = getSupplierNames(allOffers).map(name => {
     const o = bySupplier.get(name);
     if (!o) return { supplier: name, status: 'MISSING', available: false, netRateAED: null, reasonCode: 'SUPPLIER_NOT_MAPPED' };
-    const available = o.Available === 'Yes' && o.Supplier_Status === 'AVAILABLE';
+    const hasValidRate = o.Net_Rate_AED != null && Number(o.Net_Rate_AED) > 0;
+    const available = o.Available === 'Yes' && o.Supplier_Status === 'AVAILABLE' && hasValidRate;
     let reasonCode = null;
     if (o.Supplier_Status === 'NOT_MAPPED') reasonCode = 'SUPPLIER_NOT_MAPPED';
-    else if (o.Supplier_Status === 'NO_RATE' || o.Net_Rate_AED == null) reasonCode = 'SUPPLIER_NO_RATE';
+    else if (o.Supplier_Status === 'NO_RATE' || !hasValidRate) reasonCode = 'SUPPLIER_NO_RATE';
     else if (!available) reasonCode = 'SUPPLIER_UNAVAILABLE';
     return {
       supplier: o.Supplier,
       status: o.Supplier_Status,
       available,
-      netRateAED: o.Net_Rate_AED == null ? null : Number(o.Net_Rate_AED),
+      netRateAED: hasValidRate ? Number(o.Net_Rate_AED) : null,
       supplierHotelId: o.Supplier_Hotel_ID || null,
       reasonCode
     };
@@ -135,4 +145,4 @@ async function getBestHotelOffers({ mealPlan, cancellationPolicy }) {
   return { totalHotels: hotels.length, hotels: hotels.slice(0, 10) };
 }
 
-module.exports = { rankOffers, getCheapestOffer, getBestHotelOffers, SUPPLIERS };
+module.exports = { rankOffers, getCheapestOffer, getBestHotelOffers, SUPPLIERS: CONFIGURED_SUPPLIERS };

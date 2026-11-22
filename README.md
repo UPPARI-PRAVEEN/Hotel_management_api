@@ -31,6 +31,23 @@ The supplied `dubai_100_records_per_hotel_supplier_training (2).csv` was inspect
 - 77,005 AVAILABLE, 10,435 NO_RATE, and 12,560 NOT_MAPPED rows
 - No duplicate rows, invalid negative rates, or invalid currencies detected
 
+## Supplier recommendation requirements
+
+The supplier recommendation must account for both parts of an offer:
+
+- **Meal plan:** Room Only (RO) or Bed & Breakfast (BB)
+- **Cancellation policy:** refundable or non-refundable
+
+Together these define four distinct offer groups: RO refundable, RO non-refundable, BB refundable, and BB non-refundable. Rates must only be compared within the same group and the same search context. For a given hotel, the lowest eligible rate can come from a different supplier in each group; for example, one supplier may be strongest for RO while another is strongest for refundable RO. Do not select one supplier as the winner for every offer type at a hotel.
+
+The requested output is a clear signal of which supplier wins for each hotel and offer group, along with the competing offers and enough historical context to identify suppliers that reliably perform well. “Golden supplier” therefore means the best-performing supplier for a particular hotel and offer group, not a single universal supplier. Current cheapest-rate selection and historical supplier performance are separate signals: the current cheapest offer is the best eligible rate for that search, while historical metrics help assess a supplier's past competitiveness and availability.
+
+The comparison should use the exact search context and equivalent offer conditions. At minimum, isolate by search ID, hotel, meal plan, and cancellation policy; include any additional quote-defining search keys (such as stay dates, occupancy, or room conditions) when they are present in the source data. Compare rates in a common currency and exclude unavailable, unmapped, missing, or invalid-price offers from cheapest-rate selection. Resolve equal prices deterministically and report ties rather than implying a unique winner.
+
+The current dataset has about 100,000 rows and five suppliers. The design should anticipate growth to millions of offer records and approximately 80 suppliers, as well as searches with multiple search keys. ClickHouse is the project's analytical store for ingestion and high-volume filtering/ranking. Streamed, batched imports and exact-key queries are already used; production readiness at the larger scale still requires workload-based latency and capacity benchmarks. A persistent aggregate or materialized view can support historical performance summaries as data grows.
+
+Supplier coverage should not be assumed to remain at the current five suppliers: avoid making supplier-specific business logic depend on a fixed supplier list when expanding the integration. Preserve explicit outcomes for missing, unavailable, and no-rate suppliers so the recommendation remains explainable as suppliers are added.
+
 ## Setup and run instructions
 
 ### Prerequisites
@@ -88,9 +105,10 @@ Run this command from the project directory:
 
 ```powershell
 curl.exe --data-binary "@sql/01_create_tables.sql" "http://localhost:8123/?multiquery=1"
+curl.exe --data-binary "@sql/04_best_offers_view.sql" "http://localhost:8123/?multiquery=1"
 ```
 
-The configured database defaults to `hotel_intelligence`.
+The configured database defaults to `hotel_intelligence`. The second script creates the query-time `best_offers` view over the raw records. It includes a row for each exact search/hotel/meal/policy group, including groups with no eligible offers.
 
 ### 5. Audit and import the supplier data
 
@@ -149,6 +167,12 @@ npm run import:csv
 
 Set `DATASET_PATH` and `CSV_BATCH_SIZE` to import another file or change batch size. CSV parsing is streamed and ClickHouse inserts are batched. Missing monetary values remain `null`; they are never converted to zero. Duplicate keys are logged and ReplacingMergeTree uses ingestion timestamp to retain only the latest version. Invalid rows are rejected and counted.
 
+Run a reproducible local demonstration using the bundled sample. It prints a valid comparison from the CSV, a sample group where Supplier D has `NO_RATE` or `NOT_MAPPED`, and a deterministic equal-price tie:
+
+```powershell
+npm run demo:rate
+```
+
 For Excel input, convert `.xlsx` to CSV while preserving headers and text values:
 
 ```text
@@ -189,12 +213,27 @@ Example fields:
   "supplierOffers": [],
   "reasonCodes": ["LOWEST_ELIGIBLE_RATE"],
   "historicalRecommendation": null,
+  "historicalRecommendationStatus": "INSUFFICIENT_HISTORY",
   "recommendationConfidence": null,
+  "cache": {"status": "miss", "ageMs": 0},
   "latencyMs": 0
 }
 ```
 
 Zod validates the search ID, hotel ID, meal plan, and cancellation policy. SQL uses ClickHouse `query_params`; user input is never concatenated.
+
+Responses report `historicalRecommendationStatus` (`AVAILABLE`, `INSUFFICIENT_HISTORY`, or `UNAVAILABLE`) and cache status. The API caches exact recommendation keys in process memory for 30 seconds by default. If ClickHouse fails after a previously successful response expires, the API can serve that response for up to five additional minutes, explicitly marked `cache.status: "stale-fallback"` with its age. If there is no usable cached result, the endpoint returns HTTP 503 rather than inventing a recommendation. This cache is per application instance; multi-instance deployments need a shared cache and ingestion-driven invalidation.
+
+The `best_offers` view exposes the current winner, runner-up, savings, tie count, and eligible supplier count per exact search group. It deduplicates to the latest ingested version and applies the same eligibility and deterministic ordering rules as the API. Example:
+
+```sql
+SELECT *
+FROM hotel_intelligence.best_offers
+WHERE Search_ID = 'SRCH0000001'
+  AND Hotel_ID = 'DXB00001'
+  AND Meal_Plan = 'RO'
+  AND Cancellation_Policy = 'Non-Refundable';
+```
 
 ## Algorithm
 
@@ -212,11 +251,29 @@ Each input is normalized to a 0–100 scale. Confidence is LOW, MEDIUM, or HIGH 
 
 The supplied data has no stay dates, booking conversions, uptime, or fulfillment outcomes. Those limitations are documented and no booking success data is inferred.
 
+### Open-source model roadmap
+
+The current production baseline remains deterministic, explainable SQL/rules. Do not train a booking-conversion or fulfillment model from the supplied data: those labels are absent. Once reliable labels exist, evaluate LightGBM or CatBoost as open-source ranking candidates. Candidate features include normalized price and price rank within the exact offer group, supplier availability and mapping status, meal plan, cancellation class, hotel, and (once collected) lead time, stay duration, and cancellation deadline. Only use booking conversion or successful fulfillment as labels after those outcomes are collected and definitions are agreed.
+
+Validate with time-based, search-grouped train/validation/test splits so offers from one search cannot leak across splits. Compare against the deterministic cheapest-rate baseline using ranking metrics and business outcomes; calibrate confidence and retain an explainable rule-based fallback. Exclude post-booking and future-derived fields from prediction features, monitor feature/label drift and supplier coverage, and version datasets/models with a documented retraining and rollback process.
+
+Future HB/FB support requires adding those meal-plan values consistently to ingestion validation, API validation, storage, and queries; current filters must continue to isolate meal plans. Dated cancellation terms require explicit deadline/time-zone and fee fields from suppliers, including a versioned normalization policy; the current refundable/non-refundable flag and synthetic fee are not substitutes for actual free-cancellation deadlines.
+
 ## ClickHouse choices
 
 `ReplacingMergeTree(Ingested_At)` supports duplicate and incremental re-ingestion. The partition is monthly by ingestion time and the primary key is optimized for exact offer-group filters and supplier ranking. For 80 suppliers, add LowCardinality where appropriate, widen only if needed, and use a separate supplier dimension table if more metadata is required.
 
-For historical metrics, maintain or add a materialized aggregate table in production. Redis caching is optional; cache exact five-part keys and invalidate on ingestion completion. `p95 < 500 ms` is an initial objective and must be measured under a defined workload; no benchmark is claimed here.
+The supplier list is configurable through `SUPPLIER_NAMES` and is also expanded from suppliers observed in offer data, so new supplier rows are not dropped from ranking output. Configure the full supplier registry to report expected suppliers that are missing from a result.
+
+The `best_offers` object is a normal view and recomputes from the raw table; it is convenient for correctness and auditability, not a pre-aggregated acceleration layer. For larger production workloads, benchmark first, then consider a refreshable/materialized aggregate that preserves latest-version semantics and exact search-group keys. The current bounded in-memory cache is exact-keyed, and its TTL, stale window, and entry limit are configurable in `.env`.
+
+Run the API before collecting an endpoint latency sample:
+
+```powershell
+npm run benchmark:api
+```
+
+The benchmark makes sequential requests for one exact key, reports first-request latency and warm-path p50/p95, and can enforce `BENCHMARK_TARGET_P95_MS`. A local 10-request smoke run against ClickHouse measured one cache miss and nine hits: first-request client latency 837.20 ms, warm client p50 7.55 ms, warm client p95 11.41 ms, and API-reported p95 715.09 ms across all requests. The 500 ms warm-path p95 is an initial objective; this single-instance smoke run is not a cold-query capacity or multi-user load test, and the threshold was not explicitly enabled for that run.
 
 ## Tests
 
@@ -225,10 +282,11 @@ npm test
 ```
 
 Jest covers normal/price-tie/missing/NO_RATE/NOT_MAPPED/unavailable/one/no eligible selection, validation, meal/cancellation isolation, and insufficient historical samples.
+`npm run demo:rate` demonstrates sample-data comparison, Supplier D `NO_RATE`/`NOT_MAPPED`, and a deterministic tie without requiring ClickHouse. `npm run benchmark:api` measures the running API's sequential warm-cache path.
 
 ## Limitations
 
 - Docker must be started outside this environment because Docker is unavailable here.
-- Live ClickHouse integration could not be run here.
-- Historical SQL and API integration should be benchmarked after ClickHouse startup.
-- Redis and ML are not trained or enabled.
+- The `best_offers` view was created and queried against the reachable local ClickHouse instance. The API has a local smoke benchmark, but historical SQL and the end-to-end API path still need representative workload and concurrency benchmarking.
+- The current cache is process-local; use shared cache/invalidation for multiple API replicas.
+- Redis is not deployed, and no ML model is trained.
